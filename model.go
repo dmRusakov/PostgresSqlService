@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -882,6 +883,14 @@ func (m *Model) scanRow(row pgx.Row, dest any) error {
 					fv.SetInt(int64(ptr.Int16))
 				}
 			})
+		case reflect.TypeOf(uint(0)): // uint
+			ptr := new(sql.NullInt64)
+			scanArgs[i] = ptr
+			postScan = append(postScan, func() {
+				if ptr.Valid {
+					fv.SetUint(uint64(ptr.Int64))
+				}
+			})
 		case reflect.TypeOf(uint64(0)): // uint64
 			ptr := new(sql.NullInt64)
 			scanArgs[i] = ptr
@@ -930,7 +939,15 @@ func (m *Model) scanRow(row pgx.Row, dest any) error {
 					fv.SetFloat(ptr.Float64)
 				}
 			})
-		case reflect.TypeOf([]byte{}): // []byte
+		case reflect.TypeOf(json.RawMessage{}): // json.RawMessage → JSONB
+			ptr := new([]byte)
+			scanArgs[i] = ptr
+			postScan = append(postScan, func() {
+				if *ptr != nil {
+					fv.Set(reflect.ValueOf(json.RawMessage(*ptr)))
+				}
+			})
+		case reflect.TypeOf([]byte{}): // []byte / BYTEA
 			ptr := new([]byte)
 			scanArgs[i] = ptr
 			postScan = append(postScan, func() {
@@ -1011,6 +1028,72 @@ func (m *Model) scanRow(row pgx.Row, dest any) error {
 					fv.Set(reflect.ValueOf(&val))
 				} else {
 					fv.Set(reflect.ValueOf((*float32)(nil)))
+				}
+			})
+		case reflect.TypeOf((*int8)(nil)): // *int8
+			ptr := new(sql.NullInt16)
+			scanArgs[i] = ptr
+			postScan = append(postScan, func() {
+				if ptr.Valid {
+					val := int8(ptr.Int16)
+					fv.Set(reflect.ValueOf(&val))
+				} else {
+					fv.Set(reflect.ValueOf((*int8)(nil)))
+				}
+			})
+		case reflect.TypeOf((*uint)(nil)): // *uint
+			ptr := new(sql.NullInt64)
+			scanArgs[i] = ptr
+			postScan = append(postScan, func() {
+				if ptr.Valid {
+					val := uint(ptr.Int64)
+					fv.Set(reflect.ValueOf(&val))
+				} else {
+					fv.Set(reflect.ValueOf((*uint)(nil)))
+				}
+			})
+		case reflect.TypeOf((*uint64)(nil)): // *uint64
+			ptr := new(sql.NullInt64)
+			scanArgs[i] = ptr
+			postScan = append(postScan, func() {
+				if ptr.Valid {
+					val := uint64(ptr.Int64)
+					fv.Set(reflect.ValueOf(&val))
+				} else {
+					fv.Set(reflect.ValueOf((*uint64)(nil)))
+				}
+			})
+		case reflect.TypeOf((*uint32)(nil)): // *uint32
+			ptr := new(sql.NullInt64)
+			scanArgs[i] = ptr
+			postScan = append(postScan, func() {
+				if ptr.Valid {
+					val := uint32(ptr.Int64)
+					fv.Set(reflect.ValueOf(&val))
+				} else {
+					fv.Set(reflect.ValueOf((*uint32)(nil)))
+				}
+			})
+		case reflect.TypeOf((*uint16)(nil)): // *uint16
+			ptr := new(sql.NullInt64)
+			scanArgs[i] = ptr
+			postScan = append(postScan, func() {
+				if ptr.Valid {
+					val := uint16(ptr.Int64)
+					fv.Set(reflect.ValueOf(&val))
+				} else {
+					fv.Set(reflect.ValueOf((*uint16)(nil)))
+				}
+			})
+		case reflect.TypeOf((*uint8)(nil)): // *uint8
+			ptr := new(sql.NullInt64)
+			scanArgs[i] = ptr
+			postScan = append(postScan, func() {
+				if ptr.Valid {
+					val := uint8(ptr.Int64)
+					fv.Set(reflect.ValueOf(&val))
+				} else {
+					fv.Set(reflect.ValueOf((*uint8)(nil)))
 				}
 			})
 		case reflect.TypeOf((*bool)(nil)): // *bool
@@ -1281,18 +1364,22 @@ func goTypeToSQL(t reflect.Type) string {
 		return "BOOLEAN"
 	case t == reflect.TypeOf(""):
 		return "TEXT"
-	case t.Kind() == reflect.Int16:
+	case t == reflect.TypeOf(json.RawMessage{}):
+		return "JSONB"
+	case t == reflect.TypeOf([]byte{}):
+		return "BYTEA"
+	case t.Kind() == reflect.Int8, t.Kind() == reflect.Int16,
+		t.Kind() == reflect.Uint8:
 		return "SMALLINT"
-	case t.Kind() == reflect.Int64:
-		return "BIGINT"
-	case t.Kind() == reflect.Int, t.Kind() == reflect.Int32:
+	case t.Kind() == reflect.Uint16, t.Kind() == reflect.Uint,
+		t.Kind() == reflect.Int, t.Kind() == reflect.Int32, t.Kind() == reflect.Uint32:
 		return "INT"
+	case t.Kind() == reflect.Int64, t.Kind() == reflect.Uint64:
+		return "BIGINT"
 	case t.Kind() == reflect.Float32:
 		return "REAL"
 	case t.Kind() == reflect.Float64:
 		return "DOUBLE PRECISION"
-	case t == reflect.TypeOf([]byte{}):
-		return "BYTEA"
 	default:
 		return "TEXT"
 	}
