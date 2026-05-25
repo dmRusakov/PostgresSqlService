@@ -3,10 +3,13 @@ package postgressql
 import (
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"fmt"
-	"time"
-
+	"io"
+	"os"
 	"reflect"
+	"strings"
+	"time"
 
 	"github.com/dmRusakov/PostgresSqlService/tracing"
 	"github.com/dmRusakov/PostgresSqlService/utils/crypt"
@@ -38,6 +41,7 @@ type Model struct {
 	DbFieldCash  map[string]string // DbFieldCash is a cache for field names to database column names (e.g., "ID" to "id").
 	Item         any               // Item is the type of the item that the model will work with, used for reflection.
 	SearchFields []string          // SearchFields fields to search data in the table
+	initData     string
 }
 
 func NewStorage(
@@ -46,16 +50,28 @@ func NewStorage(
 	table string,
 	item any,
 	searchFields []string,
-) (*Model, error) {
-
-	return &Model{
+	initData string,
+) *Model {
+	m := &Model{
 		Schema:       schema,
 		Table:        table,
 		Client:       client,
 		DbFieldCash:  map[string]string{},
 		Item:         item,
 		SearchFields: searchFields,
-	}, nil
+		initData:     initData,
+	}
+
+	if client != nil {
+		if err := m.makeSchemaIfNotExist(); err != nil {
+			panic(err)
+		}
+		if err := m.makeTableIfNotExist(); err != nil {
+			panic(err)
+		}
+	}
+
+	return m
 }
 
 // List - List items with optional filters and ordering.
@@ -1074,4 +1090,256 @@ func (m *Model) doInTransaction(ctx context.Context, fn func(tx pgx.Tx) error) e
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (m *Model) makeSchemaIfNotExist() error {
+	ctx := context.Background()
+	if _, err := m.Client.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`); err != nil {
+		return fmt.Errorf("failed to ensure uuid-ossp extension: %w", err)
+	}
+	if _, err := m.Client.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS "%s";`, m.Schema)); err != nil {
+		return fmt.Errorf("failed to create schema %s: %w", m.Schema, err)
+	}
+	return nil
+}
+
+func (m *Model) makeTableIfNotExist() error {
+	ctx := context.Background()
+
+	exists, err := IsTableExists(ctx, m.Client, m.Schema, m.Table)
+	if err != nil {
+		return fmt.Errorf("failed to check if table %s.%s exists: %w", m.Schema, m.Table, err)
+	}
+	if exists {
+		return nil
+	}
+
+	ddl, indexes, err := m.buildTableDDL()
+	if err != nil {
+		return fmt.Errorf("failed to build DDL for %s.%s: %w", m.Schema, m.Table, err)
+	}
+
+	tx, err := m.Client.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for %s.%s: %w", m.Schema, m.Table, err)
+	}
+
+	if _, err := tx.Exec(ctx, ddl); err != nil {
+		_ = tx.Rollback(ctx)
+		return fmt.Errorf("failed to create table %s.%s: %w", m.Schema, m.Table, err)
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(ctx, idx); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("failed to create index on %s.%s: %w", m.Schema, m.Table, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit table creation for %s.%s: %w", m.Schema, m.Table, err)
+	}
+
+	if m.initData != "" {
+		if err := m.loadCSV(ctx, m.initData); err != nil {
+			return fmt.Errorf("failed to load init data for %s.%s: %w", m.Schema, m.Table, err)
+		}
+	}
+
+	return nil
+}
+
+// buildTableDDL generates a CREATE TABLE statement and accompanying CREATE INDEX
+// statements by reflecting over m.Item's struct tags:
+//
+//	pg:"TYPE"        – override the SQL column type
+//	pk:"true"        – mark as PRIMARY KEY (uuid.UUID gets DEFAULT uuid_generate_v4())
+//	default:"expr"   – SQL DEFAULT expression
+//	index:"true|unique|gist" – create a corresponding index
+//	fk:"schema.tbl.col[:cascade]" – add REFERENCES … [ON DELETE CASCADE]
+//
+// Auto-rules:
+//   - Field named "ID", db tag "id", type uuid.UUID at depth 0 → auto PK
+//   - Fields named created_at / updated_at / audited_at / started_at → DEFAULT NOW()
+//   - Non-pointer fields → NOT NULL (unless PK or has a DEFAULT)
+//   - Embedded (anonymous) struct fields are walked recursively; pk/fk/index tags
+//     are honoured only at depth 0
+func (m *Model) buildTableDDL() (string, []string, error) {
+	t := reflect.TypeOf(m.Item)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+
+	qualified := `"` + m.Schema + `"."` + m.Table + `"`
+	var colDefs []string
+	var indexes []string
+
+	var walk func(reflect.Type, int)
+	walk = func(t reflect.Type, depth int) {
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.Anonymous {
+				ft := f.Type
+				if ft.Kind() == reflect.Ptr {
+					ft = ft.Elem()
+				}
+				if ft.Kind() == reflect.Struct {
+					walk(ft, depth+1)
+				}
+				continue
+			}
+
+			dbCol := f.Tag.Get("db")
+			if dbCol == "" || dbCol == "-" {
+				continue
+			}
+			col := `"` + dbCol + `"`
+
+			sqlType := goTypeToSQL(f.Type)
+			if pg := f.Tag.Get("pg"); pg != "" {
+				sqlType = pg
+			}
+
+			isPtr := f.Type.Kind() == reflect.Ptr
+			isAutoPK := depth == 0 && f.Name == "ID" && dbCol == "id" && f.Type == reflect.TypeOf(uuid.UUID{})
+			isPK := depth == 0 && (f.Tag.Get("pk") == "true" || isAutoPK)
+
+			parts := []string{col, sqlType}
+
+			if isPK {
+				if f.Type == reflect.TypeOf(uuid.UUID{}) {
+					parts = append(parts, "PRIMARY KEY DEFAULT public.uuid_generate_v4()")
+				} else {
+					parts = append(parts, "PRIMARY KEY")
+				}
+			} else {
+				hasDefault := false
+				if dv := f.Tag.Get("default"); dv != "" {
+					parts = append(parts, "DEFAULT "+dv)
+					hasDefault = true
+				} else {
+					switch dbCol {
+					case "created_at", "updated_at", "audited_at", "started_at":
+						parts = append(parts, "DEFAULT NOW()")
+						hasDefault = true
+					}
+				}
+				if !isPtr && !hasDefault {
+					parts = append(parts, "NOT NULL")
+				}
+				if depth == 0 {
+					if fk := f.Tag.Get("fk"); fk != "" {
+						p := strings.SplitN(fk, ":", 2)
+						ref := p[0]
+						if len(p) == 2 && strings.EqualFold(p[1], "cascade") {
+							parts = append(parts, "REFERENCES "+ref+" ON DELETE CASCADE")
+						} else {
+							parts = append(parts, "REFERENCES "+ref)
+						}
+					}
+				}
+			}
+
+			colDefs = append(colDefs, strings.Join(parts, " "))
+
+			if depth == 0 {
+				if idx := f.Tag.Get("index"); idx != "" {
+					idxName := `"idx_` + m.Schema + "_" + m.Table + "_" + dbCol + `"`
+					switch strings.ToLower(idx) {
+					case "unique":
+						indexes = append(indexes, fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s (%s);", idxName, qualified, col))
+					case "gist":
+						indexes = append(indexes, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s USING GIST (%s);", idxName, qualified, col))
+					default:
+						indexes = append(indexes, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s);", idxName, qualified, col))
+					}
+				}
+			}
+		}
+	}
+
+	walk(t, 0)
+	if len(colDefs) == 0 {
+		return "", nil, fmt.Errorf("no db-tagged columns found in %T", m.Item)
+	}
+
+	ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n\t%s\n);", qualified, strings.Join(colDefs, ",\n\t"))
+	return ddl, indexes, nil
+}
+
+// goTypeToSQL maps a Go reflect.Type to its default PostgreSQL column type.
+// The pg struct tag overrides this at call sites.
+func goTypeToSQL(t reflect.Type) string {
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	switch {
+	case t == reflect.TypeOf(uuid.UUID{}):
+		return "UUID"
+	case t == reflect.TypeOf(time.Time{}):
+		return "TIMESTAMPTZ"
+	case t == reflect.TypeOf(false):
+		return "BOOLEAN"
+	case t == reflect.TypeOf(""):
+		return "TEXT"
+	case t.Kind() == reflect.Int16:
+		return "SMALLINT"
+	case t.Kind() == reflect.Int64:
+		return "BIGINT"
+	case t.Kind() == reflect.Int, t.Kind() == reflect.Int32:
+		return "INT"
+	case t.Kind() == reflect.Float32:
+		return "REAL"
+	case t.Kind() == reflect.Float64:
+		return "DOUBLE PRECISION"
+	case t == reflect.TypeOf([]byte{}):
+		return "BYTEA"
+	default:
+		return "TEXT"
+	}
+}
+
+func (m *Model) loadCSV(ctx context.Context, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	r.TrimLeadingSpace = true
+
+	headers, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("failed to read CSV headers: %w", err)
+	}
+	for i, h := range headers {
+		headers[i] = strings.TrimSpace(h)
+	}
+
+	qualified := fmt.Sprintf(`"%s"."%s"`, m.Schema, m.Table)
+	for {
+		record, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read CSV record: %w", err)
+		}
+		vals := make([]any, len(record))
+		for i, v := range record {
+			vals[i] = v
+		}
+		stmt := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).
+			Insert(qualified).
+			Columns(headers...).
+			Values(vals...)
+		query, args, qErr := stmt.ToSql()
+		if qErr != nil {
+			return qErr
+		}
+		if _, err := m.Client.Exec(ctx, query, args...); err != nil {
+			return fmt.Errorf("failed to insert CSV row into %s: %w", qualified, err)
+		}
+	}
+	return nil
 }

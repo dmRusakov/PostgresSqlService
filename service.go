@@ -25,11 +25,11 @@ type Service struct {
 	validateFunc *map[string]func(any) error
 }
 
-func NewService(storage *Model, dtoFunc *map[string]func(any) any, validateFunc *map[string]func(any) error) *Service {
+func NewService(p Parameters) *Service {
 	return &Service{
-		model:        storage,
-		dtoFunc:      dtoFunc,
-		validateFunc: validateFunc,
+		model:        NewStorage(p.DB, p.Schema, p.Table, p.Item, p.SearchFields, p.InitData),
+		dtoFunc:      p.DtoFunc,
+		validateFunc: p.ValidateFunc,
 	}
 }
 

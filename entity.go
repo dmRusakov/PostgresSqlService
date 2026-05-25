@@ -8,6 +8,17 @@ type Config struct {
 	DB       string
 }
 
+type Parameters struct {
+	DB           Client
+	Schema       string
+	Table        string
+	Item         any
+	SearchFields []string
+	DtoFunc      *map[string]func(any) any
+	ValidateFunc *map[string]func(any) error
+	InitData     string
+}
+
 type Order struct {
 	By    string `json:"by"`    // OrderBy is the field name (form Struct) to order by
 	Dir   string `json:"dir"`   // OrderDir is the direction of the order, can be "asc" or "desc"
