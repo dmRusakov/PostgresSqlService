@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -875,4 +876,18 @@ func check[T comparable](t *testing.T, field string, want, got T) {
 	if got != want {
 		t.Errorf("%s: got %v, want %v", field, got, want)
 	}
+}
+
+// TestMain runs the entire test suite 100 times to stress the service for
+// performance validation, correctness under load, and to aid optimization cycles.
+// Use `go test -run=^TestService_Create_succeeds$` (or similar) + timeout for quick partial runs during dev.
+func TestMain(m *testing.M) {
+	const repeats = 100
+	exitCode := 0
+	for i := 0; i < repeats; i++ {
+		if code := m.Run(); code != 0 {
+			exitCode = code
+		}
+	}
+	os.Exit(exitCode)
 }

@@ -92,23 +92,42 @@ func (s *Service) Update(ctx context.Context, entity any, field string, value an
 }
 
 func (s *Service) Patch(ctx context.Context, fieldToFind string, valueToFind any, fieldToUpdate string, valueToUpdate any) error {
-	validateData := map[string]any{fieldToFind: valueToFind, fieldToUpdate: valueToUpdate}
-	validateData = s.runDto("Patch", validateData).(map[string]any)
-	if err := s.runValidate("Patch", validateData); err != nil {
-		return err
+	if s.hasDtoOrValidate("Patch") {
+		validateData := map[string]any{fieldToFind: valueToFind, fieldToUpdate: valueToUpdate}
+		validateData = s.runDto("Patch", validateData).(map[string]any)
+		if err := s.runValidate("Patch", validateData); err != nil {
+			return err
+		}
 	}
 	return s.model.Patch(ctx, fieldToFind, valueToFind, fieldToUpdate, valueToUpdate)
 }
 
 func (s *Service) Delete(ctx context.Context, field string, value any) error {
-	validateData := map[string]any{field: value}
-	validateData = s.runDto("Delete", validateData).(map[string]any)
-	if err := s.runValidate("Delete", validateData); err != nil {
-		return err
+	if s.hasDtoOrValidate("Delete") {
+		validateData := map[string]any{field: value}
+		validateData = s.runDto("Delete", validateData).(map[string]any)
+		if err := s.runValidate("Delete", validateData); err != nil {
+			return err
+		}
 	}
 	return s.model.Delete(ctx, field, value)
 }
 
 func (s *Service) TableIndex(ctx context.Context) (*string, error) {
 	return s.model.TableIndex(ctx)
+}
+
+// hasDtoOrValidate reports whether a DtoFunc or ValidateFunc is registered for the given operation.
+func (s *Service) hasDtoOrValidate(op string) bool {
+	if s.dtoFunc != nil {
+		if _, ok := (*s.dtoFunc)[op]; ok {
+			return true
+		}
+	}
+	if s.validateFunc != nil {
+		if _, ok := (*s.validateFunc)[op]; ok {
+			return true
+		}
+	}
+	return false
 }

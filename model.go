@@ -43,6 +43,11 @@ type Model struct {
 	Item         any               // Item is the type of the item that the model will work with, used for reflection.
 	SearchFields []string          // SearchFields fields to search data in the table
 	initData     string
+
+	// Cached for performance (avoid repeated reflection + fmt in hot paths)
+	columns       []string // db column names for all tagged fields
+	tableRef      string   // "schema.table" for use in FROM/UPDATE etc (unquoted form as original)
+	searchColumns []string // cached db columns for SearchFields
 }
 
 func NewStorage(
@@ -61,6 +66,22 @@ func NewStorage(
 		Item:         item,
 		SearchFields: searchFields,
 		initData:     initData,
+	}
+
+	// Precompute for fast query building and scanning (eliminates per-op reflection in select paths)
+	itemType := reflect.TypeOf(item)
+	if itemType.Kind() == reflect.Ptr {
+		itemType = itemType.Elem()
+	}
+	m.columns = collectColumns(itemType)
+	m.tableRef = fmt.Sprintf("%s.%s", schema, table)
+
+	// Prefill column name cache at construction (first getColumn will hit memory, no reflect)
+	m.prefillDBFieldCache(itemType)
+
+	m.searchColumns = make([]string, len(searchFields))
+	for i, f := range searchFields {
+		m.searchColumns[i] = m.getColumn(f) // populates DbFieldCash too
 	}
 
 	if client != nil {
@@ -157,9 +178,10 @@ func (m *Model) Search(
 
 	// Apply search conditions for each search field using sq.Or
 	orConditions := sq.Or{}
-	for _, field := range m.SearchFields {
-		column := m.getColumn(field)
-		orConditions = append(orConditions, sq.Like{column: "%" + value + "%"})
+	for _, column := range m.searchColumns {
+		if column != "" {
+			orConditions = append(orConditions, sq.Like{column: "%" + value + "%"})
+		}
 	}
 	statement = statement.Where(orConditions)
 
@@ -190,7 +212,7 @@ func (m *Model) Exists(
 	searchFieldName string,
 	searchFieldValue any,
 ) bool {
-	statement := sq.Select("1").From(fmt.Sprintf("%s.%s", m.Schema, m.Table)).
+	statement := sq.Select("1").From(m.tableRef).
 		Where(sq.Eq{m.getColumn(searchFieldName): searchFieldValue}).
 		PlaceholderFormat(sq.Dollar).Limit(1)
 
@@ -306,7 +328,7 @@ func (m *Model) Patch(
 	setFieldValue any, // Value to set for the field in the record
 ) error {
 	return m.doInTransaction(ctx, func(tx pgx.Tx) error {
-		statement := sq.Update(fmt.Sprintf("%s.%s", m.Schema, m.Table)).
+		statement := sq.Update(m.tableRef).
 			Set(m.getColumn(setFieldName), setFieldValue).
 			Where(sq.Eq{m.getColumn(searchFieldName): searchFieldValue}).
 			PlaceholderFormat(sq.Dollar)
@@ -346,7 +368,7 @@ func (m *Model) Delete(
 	searchFieldValue any, // Value of the field to search for the record to delete
 ) error {
 	return m.doInTransaction(ctx, func(tx pgx.Tx) error {
-		statement := sq.Delete(fmt.Sprintf("%s.%s", m.Schema, m.Table)).
+		statement := sq.Delete(m.tableRef).
 			Where(sq.Eq{m.getColumn(searchFieldName): searchFieldValue}).
 			PlaceholderFormat(sq.Dollar)
 
@@ -402,11 +424,32 @@ func (m *Model) getColumn(field string) string {
 		}
 	}
 
-	// if not found in cache or struct, return empty string
-	err := fmt.Errorf("field %s not found in cache or struct", field)
-	tracing.Error(context.Background(), err)
-
+	// if not found in cache or struct, return empty string (caller should handle)
 	return ""
+}
+
+// prefillDBFieldCache walks the item type once at init and populates DbFieldCash
+// for all db-tagged fields so the first getColumn calls are pure map hits.
+func (m *Model) prefillDBFieldCache(t reflect.Type) {
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.Anonymous {
+			ft := f.Type
+			if ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				m.prefillDBFieldCache(ft)
+			}
+			continue
+		}
+		if tag := f.Tag.Get("db"); tag != "" {
+			m.DbFieldCash[f.Name] = tag
+		}
+	}
 }
 
 // collectColumns returns db column names for all db-tagged fields in t,
@@ -481,10 +524,10 @@ func collectFieldValues(t reflect.Type, v reflect.Value) []reflect.Value {
 // selectStatement - create a select statement for the model's table.
 func (m *Model) selectStatement() sq.SelectBuilder {
 	statement := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).Select()
-	for _, col := range collectColumns(reflect.TypeOf(m.Item)) {
+	for _, col := range m.columns {
 		statement = statement.Column(col)
 	}
-	return statement.From(fmt.Sprintf("%s.%s", m.Schema, m.Table))
+	return statement.From(m.tableRef)
 }
 
 // selectStatement by fields - create a select statement for the model's table with specific fields.
@@ -499,12 +542,12 @@ func (m *Model) selectStatementByFields(fields []string) sq.SelectBuilder {
 		}
 	}
 
-	return statement.From(fmt.Sprintf("%s.%s", m.Schema, m.Table))
+	return statement.From(m.tableRef)
 }
 
 // insertStatement - create an insert statement for the given item.
 func (m *Model) insertStatement(item any) *sq.InsertBuilder {
-	statement := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).Insert(fmt.Sprintf("%s.%s", m.Schema, m.Table))
+	statement := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).Insert(m.tableRef)
 	t := reflect.TypeOf(item)
 	v := reflect.ValueOf(item)
 	if t.Kind() == reflect.Ptr {
@@ -517,7 +560,7 @@ func (m *Model) insertStatement(item any) *sq.InsertBuilder {
 
 // updateStatement - create an update statement for the given item.
 func (m *Model) updateStatement(item any) *sq.UpdateBuilder {
-	statement := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).Update(fmt.Sprintf("%s.%s", m.Schema, m.Table))
+	statement := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).Update(m.tableRef)
 	t := reflect.TypeOf(item)
 	v := reflect.ValueOf(item)
 	if t.Kind() == reflect.Ptr {
@@ -547,11 +590,11 @@ func (m *Model) orderAndPaging(
 		}
 	}
 
-	// page and limit PTO
+	// page and limit (PTO = pagination)
 	if order.Limit == 0 {
-		order.Limit = 25 // Default to 100 items per page if not specified
+		order.Limit = 25
 	}
-	statement = statement.Offset((order.Page) * order.Limit).Limit(order.Limit)
+	statement = statement.Offset(order.Page * order.Limit).Limit(order.Limit)
 
 	return statement
 }
@@ -1403,7 +1446,6 @@ func (m *Model) loadCSV(ctx context.Context, path string) error {
 		headers[i] = strings.TrimSpace(h)
 	}
 
-	qualified := fmt.Sprintf(`"%s"."%s"`, m.Schema, m.Table)
 	for {
 		record, err := r.Read()
 		if err == io.EOF {
@@ -1417,7 +1459,7 @@ func (m *Model) loadCSV(ctx context.Context, path string) error {
 			vals[i] = v
 		}
 		stmt := sq.StatementBuilder.PlaceholderFormat(sq.Dollar).
-			Insert(qualified).
+			Insert(m.tableRef).
 			Columns(headers...).
 			Values(vals...)
 		query, args, qErr := stmt.ToSql()
@@ -1425,7 +1467,7 @@ func (m *Model) loadCSV(ctx context.Context, path string) error {
 			return qErr
 		}
 		if _, err := m.Client.Exec(ctx, query, args...); err != nil {
-			return fmt.Errorf("failed to insert CSV row into %s: %w", qualified, err)
+			return fmt.Errorf("failed to insert CSV row into %s: %w", m.tableRef, err)
 		}
 	}
 	return nil
