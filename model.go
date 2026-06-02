@@ -1356,6 +1356,15 @@ func (m *Model) buildTableDDL() (string, []string, error) {
 					if fk := f.Tag.Get("fk"); fk != "" {
 						p := strings.SplitN(fk, ":", 2)
 						ref := p[0]
+						// Auto-qualify with current schema when no schema prefix present.
+						// The prefix is everything before the first '(' (or the whole string).
+						prefix := ref
+						if idx := strings.IndexByte(ref, '('); idx >= 0 {
+							prefix = ref[:idx]
+						}
+						if !strings.Contains(prefix, ".") {
+							ref = `"` + m.Schema + `".` + ref
+						}
 						if len(p) == 2 && strings.EqualFold(p[1], "cascade") {
 							parts = append(parts, "REFERENCES "+ref+" ON DELETE CASCADE")
 						} else {
