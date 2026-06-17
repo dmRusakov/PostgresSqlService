@@ -86,18 +86,36 @@ func DoWithAttempts(fn func() error, maxAttempts int, delay time.Duration) error
 	return err
 }
 
+func trimQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		first, last := s[0], s[len(s)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
 func (c *Config) ConnStringFromCfg() string {
+	user := trimQuotes(c.User)
+	pass := trimQuotes(c.Password)
+	host := trimQuotes(c.Host)
+	port := trimQuotes(c.Port)
+	db := trimQuotes(c.DB)
+
 	url := strings.Builder{}
 	url.WriteString("postgres://")
-	url.WriteString(c.User)
+	url.WriteString(user)
 	url.WriteString(":")
-	url.WriteString(c.Password)
+	url.WriteString(pass)
 	url.WriteString("@")
-	url.WriteString(c.Host)
+	url.WriteString(host)
 	url.WriteString(":")
-	url.WriteString(c.Port)
+	url.WriteString(port)
 	url.WriteString("/")
-	url.WriteString(c.DB)
+	url.WriteString(db)
+	url.WriteString("?sslmode=disable")
 
 	return url.String()
 }

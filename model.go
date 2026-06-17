@@ -1223,6 +1223,9 @@ func (m *Model) makeSchemaIfNotExist() error {
 	if _, err := m.Client.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`); err != nil {
 		return fmt.Errorf("failed to ensure uuid-ossp extension: %w", err)
 	}
+	if _, err := m.Client.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS postgis;`); err != nil {
+		return fmt.Errorf("failed to ensure postgis extension: %w", err)
+	}
 	if _, err := m.Client.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS "%s";`, m.Schema)); err != nil {
 		return fmt.Errorf("failed to create schema %s: %w", m.Schema, err)
 	}
